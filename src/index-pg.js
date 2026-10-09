@@ -1,331 +1,564 @@
 import { DurableObject } from "cloudflare:workers";
 import { PgClient } from "@effect/sql-pg";
 import {
-  ClusterSchema,
-  Entity,
-  HttpRunner,
-  RunnerAddress,
-  RunnerHealth,
-  RunnerStorage,
-  ShardId,
-  Sharding,
-  ShardingConfig,
-  SqlMessageStorage,
-  SqlRunnerStorage,
+	ClusterWorkflowEngine,
+	ClusterSchema,
+	Entity,
+	HttpRunner,
+	RunnerAddress,
+	RunnerHealth,
+	Runners,
+	RunnerStorage,
+	ShardId,
+	Sharding,
+	ShardingConfig,
+	SqlRunnerStorage,
 } from "effect/cluster";
-import { Crypto, Duration, Effect, Layer, Option, Redacted, Schema } from "effect";
+import { Duration, Effect, Layer, Option, Redacted, Schema } from "effect";
 import { SqlClient } from "effect/sql";
 import { FetchHttpClient, HttpRouter, HttpServerResponse } from "effect/http";
 import { Rpc, RpcSerialization } from "effect/rpc";
+import { Activity, Workflow } from "effect/workflow";
+import { BoundedMessageStorageLayer } from "./bounded-message-storage.js";
+import { cryptoLayer } from "./cluster-crypto.js";
 
 const runnerIds = ["runner-0", "runner-1"];
 const runnerHostSuffix = ".cluster.local";
 const shardCount = 32;
 const shardLockExpirationMs = 30_000;
 
-const cryptoLayer = Layer.succeed(Crypto.Crypto)(
-  Crypto.make({
-    randomBytes: (size) => globalThis.crypto.getRandomValues(new Uint8Array(size)),
-    digest: (algorithm, data) =>
-      Effect.promise(async () =>
-        new Uint8Array(await globalThis.crypto.subtle.digest(algorithm, data)),
-      ),
-  }),
-);
-
 const Counter = Entity.make("Counter", [
-  Rpc.make("Increment", {
-    payload: Schema.Struct({ entityId: Schema.String }),
-    success: Schema.Struct({ value: Schema.Number, runnerId: Schema.String }),
-  }),
+	Rpc.make("Increment", {
+		payload: Schema.Struct({ entityId: Schema.String }),
+		success: Schema.Struct({ value: Schema.Number, runnerId: Schema.String }),
+	}),
 ]).annotateRpcs(ClusterSchema.Persisted, true);
 
+const CounterWorkflowResult = Schema.Struct({
+	entityId: Schema.String,
+	value: Schema.Number,
+	runnerId: Schema.String,
+});
+
+const CounterWorkflow = Workflow.make("CounterWorkflow", {
+	payload: Schema.Struct({ operationId: Schema.String, entityId: Schema.String }),
+	success: CounterWorkflowResult,
+	idempotencyKey: ({ operationId }) => operationId,
+});
+
+const ensureTaskTable = (sql) =>
+	sql`
+		CREATE TABLE IF NOT EXISTS workers_repro_tasks (
+			task_id TEXT PRIMARY KEY,
+			entity_id TEXT NOT NULL,
+			execution_id TEXT NOT NULL,
+			status TEXT NOT NULL CHECK (status IN ('running', 'complete')),
+			result JSONB,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)
+	`;
+
+const ensureWorkflowCounterTable = (sql) =>
+	sql`
+		CREATE TABLE IF NOT EXISTS workers_repro_workflow_counter (
+			entity_id TEXT PRIMARY KEY,
+			value INTEGER NOT NULL,
+			runner_id TEXT NOT NULL
+		)
+	`;
+
 const makeRunnerFetchLayer = (namespace) => {
-  const fetchRunner = async (input, init) => {
-    const request = new Request(input, init);
-    const url = new URL(request.url);
-    if (!url.hostname.endsWith(runnerHostSuffix)) return globalThis.fetch(request);
+	const fetchRunner = async (input, init) => {
+		const request = new Request(input, init);
+		const url = new URL(request.url);
+		if (!url.hostname.endsWith(runnerHostSuffix)) return globalThis.fetch(request);
 
-    const runnerId = url.hostname.slice(0, -runnerHostSuffix.length);
-    if (!runnerIds.includes(runnerId)) return new Response("Unknown runner", { status: 502 });
-    const headers = new Headers(request.headers);
-    headers.set("x-cluster-runner-id", runnerId);
-    return namespace.getByName(runnerId).fetch(new Request(request, { headers }));
-  };
+		const runnerId = url.hostname.slice(0, -runnerHostSuffix.length);
+		if (!runnerIds.includes(runnerId)) return new Response("Unknown runner", { status: 502 });
+		const headers = new Headers(request.headers);
+		headers.set("x-cluster-runner-id", runnerId);
+		return namespace.getByName(runnerId).fetch(new Request(request, { headers }));
+	};
 
-  return FetchHttpClient.layer.pipe(
-    Layer.provideMerge(Layer.succeed(FetchHttpClient.Fetch)(fetchRunner)),
-  );
+	return FetchHttpClient.layer.pipe(
+		Layer.provideMerge(Layer.succeed(FetchHttpClient.Fetch)(fetchRunner)),
+	);
 };
 
 const makeRunnerLayer = ({ storage, env, runnerId }) => {
-  const runnerAddress = RunnerAddress.make(`${runnerId}${runnerHostSuffix}`, 8787);
-  const shardingConfig = ShardingConfig.layer({
-    runnerAddress: Option.some(runnerAddress),
-    shardsPerGroup: shardCount,
-    shardLockExpiration: Duration.millis(shardLockExpirationMs),
-    shardLockRefreshInterval: Duration.seconds(5),
-    refreshAssignmentsInterval: Duration.millis(500),
-    entityMessagePollInterval: Duration.millis(250),
-    entityReplyPollInterval: Duration.millis(250),
-    shardLockDisableAdvisory: true,
-  });
-  const database = PgClient.layer({
-    url: Redacted.make(env.CLUSTER_DB.connectionString),
-    maxConnections: 4,
-    minConnections: 0,
-  });
-  const sqlClusterStorage = Layer.mergeAll(SqlRunnerStorage.layer, SqlMessageStorage.layer).pipe(
-    Layer.provideMerge(Layer.mergeAll(shardingConfig, database, cryptoLayer)),
-  );
-  const clusterInfrastructure = Layer.mergeAll(
-    sqlClusterStorage,
-    RunnerHealth.layerNoop,
-    RpcSerialization.layerJson,
-    makeRunnerFetchLayer(env.COUNTER_RUNNER),
-  );
-  const runnerProtocol = HttpRunner.layerClientProtocolHttp({ path: "/cluster" }).pipe(
-    Layer.provideMerge(clusterInfrastructure),
-  );
-  const clusterRunner = HttpRunner.layerHttpOptions({ path: "/cluster" }).pipe(
-    Layer.provideMerge(runnerProtocol),
-  );
-  const counter = Counter.toLayer({
-    Increment: (request) =>
-      Effect.sync(() => {
-        const rows = storage.sql
-          .exec(
-            "INSERT INTO counter (entity_id, value) VALUES (?, 1) ON CONFLICT(entity_id) DO UPDATE SET value = value + 1 RETURNING value",
-            request.payload.entityId,
-          )
-          .toArray();
-        return { value: rows[0].value, runnerId };
-      }),
-  }).pipe(Layer.provideMerge(clusterRunner));
-  const routes = Layer.mergeAll(
-    HttpRouter.add("GET", "/health", HttpServerResponse.json({ ok: true })),
-    HttpRouter.add("POST", "/increment", (request) =>
-      Effect.gen(function* () {
-        const entityId =
-          new URL(request.url, "http://runner.local").searchParams.get("id") ?? "default";
-        const makeClient = yield* Counter.client;
-        return yield* HttpServerResponse.json(
-          yield* makeClient(entityId).Increment({ entityId }),
-        );
-      }),
-    ),
-    HttpRouter.add("GET", "/debug/shard", (request) =>
-      Effect.gen(function* () {
-        const entityId =
-          new URL(request.url, "http://runner.local").searchParams.get("id") ?? "default";
-        const shardId = yield* Counter.getShardId(entityId);
-        const sharding = yield* Sharding.Sharding;
-        return yield* HttpServerResponse.json({
-          entityId,
-          shardId: shardId.toString(),
-          runnerId,
-          ownsShard: sharding.hasShardId(shardId),
-        });
-      }),
-    ),
-    HttpRouter.add("GET", "/debug/assignments", () =>
-      Effect.gen(function* () {
-        const sharding = yield* Sharding.Sharding;
-        const ownedShardIds = Array.from({ length: shardCount }, (_, index) =>
-          ShardId.make("default", index + 1),
-        )
-          .filter((shardId) => sharding.hasShardId(shardId))
-          .map((shardId) => shardId.toString());
-        return yield* HttpServerResponse.json({ runnerId, ownedShardIds });
-      }),
-    ),
-    HttpRouter.add("GET", "/debug/storage", (request) =>
-      Effect.gen(function* () {
-        const runnerStorage = yield* RunnerStorage.RunnerStorage;
-        const runners = yield* runnerStorage.getRunners;
-        const entityId = new URL(request.url, "http://runner.local").searchParams.get("id");
-        const counterRows =
-          entityId === null
-            ? storage.sql
-                .exec("SELECT entity_id, value FROM counter ORDER BY entity_id LIMIT 50")
-                .toArray()
-            : storage.sql
-                .exec("SELECT entity_id, value FROM counter WHERE entity_id = ?", entityId)
-                .toArray();
-        return yield* HttpServerResponse.json({
-          runnerId,
-          runners: runners.map(([runner, healthy]) => ({
-            address: runner.address.toString(),
-            healthy,
-          })),
-          counterRows,
-        });
-      }),
-    ),
-    HttpRouter.add("GET", "/debug/registry", () =>
-      Effect.gen(function* () {
-        const sql = yield* SqlClient.SqlClient;
-        const runners = yield* sql`
+	const runnerAddress = RunnerAddress.make(`${runnerId}${runnerHostSuffix}`, 8787);
+	const shardingConfig = ShardingConfig.layer({
+		runnerAddress: Option.some(runnerAddress),
+		shardsPerGroup: shardCount,
+		shardLockExpiration: Duration.millis(shardLockExpirationMs),
+		shardLockRefreshInterval: Duration.seconds(5),
+		refreshAssignmentsInterval: Duration.millis(500),
+		entityMessagePollInterval: Duration.millis(250),
+		entityReplyPollInterval: Duration.millis(250),
+		shardLockDisableAdvisory: true,
+	});
+	const database = PgClient.layer({
+		url: Redacted.make(env.CLUSTER_DB.connectionString),
+		maxConnections: 4,
+		minConnections: 0,
+	});
+	const sqlClusterStorage = Layer.mergeAll(SqlRunnerStorage.layer, BoundedMessageStorageLayer).pipe(
+		Layer.provideMerge(Layer.mergeAll(shardingConfig, database, cryptoLayer)),
+	);
+	const runnerFetchClient = makeRunnerFetchLayer(env.COUNTER_RUNNER);
+	const runnerProtocol = HttpRunner.layerClientProtocolHttp({ path: "/cluster" }).pipe(
+		Layer.provideMerge(Layer.mergeAll(runnerFetchClient, RpcSerialization.layerSchemaBinary())),
+	);
+	const runnerHealth = RunnerHealth.layerPing.pipe(
+		Layer.provide(Runners.layerRpc),
+		Layer.provide(runnerProtocol),
+	);
+	const clusterRunner = HttpRunner.layerHttpOptions({ path: "/cluster" }).pipe(
+		Layer.provide(runnerHealth),
+		Layer.provideMerge(sqlClusterStorage),
+		Layer.provide(shardingConfig),
+		Layer.provide(RpcSerialization.layerSchemaBinary()),
+		Layer.provideMerge(runnerProtocol),
+	);
+	const counter = Counter.toLayer({
+		Increment: (request) =>
+			Effect.sync(() => {
+				const rows = storage.sql
+					.exec(
+						"INSERT INTO counter (entity_id, value) VALUES (?, 1) ON CONFLICT(entity_id) DO UPDATE SET value = value + 1 RETURNING value",
+						request.payload.entityId,
+					)
+					.toArray();
+				return { value: rows[0].value, runnerId };
+			}),
+	}).pipe(Layer.provideMerge(clusterRunner));
+	const workflowEngine = ClusterWorkflowEngine.layer.pipe(Layer.provideMerge(clusterRunner));
+	const workflow = CounterWorkflow.toLayer((payload) =>
+		Effect.gen(function* () {
+			const incrementCounter = Activity.make({
+				name: "IncrementCounter",
+				success: CounterWorkflowResult,
+				execute: Effect.gen(function* () {
+					const sql = yield* SqlClient.SqlClient;
+					yield* ensureWorkflowCounterTable(sql);
+					const rows = yield* sql`
+						INSERT INTO workers_repro_workflow_counter (entity_id, value, runner_id)
+						VALUES (${payload.entityId}, 1, ${runnerId})
+						ON CONFLICT (entity_id) DO UPDATE
+						SET value = workers_repro_workflow_counter.value + 1,
+							runner_id = EXCLUDED.runner_id
+						RETURNING value, runner_id
+					`;
+					return {
+						entityId: payload.entityId,
+						value: Number(rows[0].value),
+						runnerId: rows[0].runner_id,
+					};
+				}),
+			});
+			return yield* incrementCounter;
+		}),
+	).pipe(Layer.provideMerge(workflowEngine));
+	const routes = Layer.mergeAll(
+		HttpRouter.add("GET", "/health", HttpServerResponse.json({ ok: true })),
+		HttpRouter.add("POST", "/internal/startup-recovery", () =>
+			Effect.gen(function* () {
+				const sql = yield* SqlClient.SqlClient;
+				yield* ensureTaskTable(sql);
+				const activeTasks = yield* sql`
+					SELECT task_id, entity_id, execution_id
+					FROM workers_repro_tasks
+				WHERE status = 'running'
+				ORDER BY updated_at ASC
+				LIMIT 20
+			`;
+				const outcomes = yield* Effect.forEach(
+					activeTasks,
+					(task) =>
+						Effect.gen(function* () {
+							const payload = { operationId: task.task_id, entityId: task.entity_id };
+							const existing = yield* CounterWorkflow.poll(task.execution_id);
+							const result = yield* CounterWorkflow.execute(payload);
+							yield* sql`
+							UPDATE workers_repro_tasks
+							SET status = 'complete', result = ${JSON.stringify(result)}::jsonb, updated_at = NOW()
+							WHERE task_id = ${task.task_id}
+						`;
+							return Option.isSome(existing) ? "existing" : "dispatched";
+						}),
+					{ concurrency: 4 },
+				);
+				return yield* HttpServerResponse.json({
+					activeTaskCount: activeTasks.length,
+					dispatchedCount: outcomes.filter((outcome) => outcome === "dispatched").length,
+					existingCount: outcomes.filter((outcome) => outcome === "existing").length,
+				});
+			}),
+		),
+		HttpRouter.add("POST", "/task/prepare-recovery", (request) =>
+			Effect.gen(function* () {
+				const url = new URL(request.url, "http://runner.local");
+				const taskId = url.searchParams.get("taskId");
+				const entityId = url.searchParams.get("id");
+				if (!taskId || !entityId) {
+					return yield* HttpServerResponse.json(
+						{ error: "taskId and id are required" },
+						{ status: 400 },
+					);
+				}
+				const sql = yield* SqlClient.SqlClient;
+				yield* ensureTaskTable(sql);
+				const payload = { operationId: taskId, entityId };
+				const executionId = yield* CounterWorkflow.executionId(payload);
+				yield* sql`
+					INSERT INTO workers_repro_tasks (task_id, entity_id, execution_id, status, result, updated_at)
+					VALUES (${taskId}, ${entityId}, ${executionId}, 'running', NULL, NOW())
+					ON CONFLICT (task_id) DO UPDATE
+					SET entity_id = EXCLUDED.entity_id,
+						execution_id = EXCLUDED.execution_id,
+						status = 'running',
+						result = NULL,
+						updated_at = NOW()
+				`;
+				return yield* HttpServerResponse.json({ taskId, executionId, status: "running" });
+			}),
+		),
+		HttpRouter.add("GET", "/task/status", (request) =>
+			Effect.gen(function* () {
+				const taskId = new URL(request.url, "http://runner.local").searchParams.get("taskId");
+				if (!taskId) {
+					return yield* HttpServerResponse.json({ error: "taskId is required" }, { status: 400 });
+				}
+				const sql = yield* SqlClient.SqlClient;
+				yield* ensureTaskTable(sql);
+				const rows = yield* sql`
+					SELECT task_id, entity_id, execution_id, status, result
+					FROM workers_repro_tasks
+					WHERE task_id = ${taskId}
+				`;
+				return yield* HttpServerResponse.json(rows[0] ?? { task_id: taskId, status: "missing" });
+			}),
+		),
+		HttpRouter.add("GET", "/debug/workflow-counter", (request) =>
+			Effect.gen(function* () {
+				const entityId = new URL(request.url, "http://runner.local").searchParams.get("id");
+				if (!entityId) {
+					return yield* HttpServerResponse.json({ error: "id is required" }, { status: 400 });
+				}
+				const sql = yield* SqlClient.SqlClient;
+				yield* ensureWorkflowCounterTable(sql);
+				const rows = yield* sql`
+					SELECT entity_id, value, runner_id
+					FROM workers_repro_workflow_counter
+					WHERE entity_id = ${entityId}
+				`;
+				return yield* HttpServerResponse.json(
+					rows[0] ?? { entity_id: entityId, value: null, runner_id: null },
+				);
+			}),
+		),
+		HttpRouter.add("GET", "/workflow/poll", (request) =>
+			Effect.gen(function* () {
+				const executionId = new URL(request.url, "http://runner.local").searchParams.get("id");
+				if (executionId === null) {
+					return yield* HttpServerResponse.json({ error: "id is required" }, { status: 400 });
+				}
+				const result = yield* CounterWorkflow.poll(executionId);
+				return yield* HttpServerResponse.json({
+					executionId,
+					state: Option.isSome(result) ? result.value._tag : "missing",
+				});
+			}),
+		),
+		HttpRouter.add("POST", "/increment", (request) =>
+			Effect.gen(function* () {
+				const entityId =
+					new URL(request.url, "http://runner.local").searchParams.get("id") ?? "default";
+				const makeClient = yield* Counter.client;
+				return yield* HttpServerResponse.json(yield* makeClient(entityId).Increment({ entityId }));
+			}),
+		),
+		HttpRouter.add("GET", "/debug/shard", (request) =>
+			Effect.gen(function* () {
+				const entityId =
+					new URL(request.url, "http://runner.local").searchParams.get("id") ?? "default";
+				const shardId = yield* Counter.getShardId(entityId);
+				const sharding = yield* Sharding.Sharding;
+				return yield* HttpServerResponse.json({
+					entityId,
+					shardId: shardId.toString(),
+					runnerId,
+					ownsShard: sharding.hasShardId(shardId),
+				});
+			}),
+		),
+		HttpRouter.add("GET", "/debug/assignments", () =>
+			Effect.gen(function* () {
+				const sharding = yield* Sharding.Sharding;
+				const ownedShardIds = Array.from({ length: shardCount }, (_, index) =>
+					ShardId.make("default", index + 1),
+				)
+					.filter((shardId) => sharding.hasShardId(shardId))
+					.map((shardId) => shardId.toString());
+				return yield* HttpServerResponse.json({ runnerId, ownedShardIds });
+			}),
+		),
+		HttpRouter.add("GET", "/debug/storage", (request) =>
+			Effect.gen(function* () {
+				const runnerStorage = yield* RunnerStorage.RunnerStorage;
+				const runners = yield* runnerStorage.getRunners;
+				const entityId = new URL(request.url, "http://runner.local").searchParams.get("id");
+				const counterRows =
+					entityId === null
+						? storage.sql
+								.exec("SELECT entity_id, value FROM counter ORDER BY entity_id LIMIT 50")
+								.toArray()
+						: storage.sql
+								.exec("SELECT entity_id, value FROM counter WHERE entity_id = ?", entityId)
+								.toArray();
+				return yield* HttpServerResponse.json({
+					runnerId,
+					runners: runners.map(([runner, healthy]) => ({
+						address: runner.address.toString(),
+						healthy,
+					})),
+					counterRows,
+				});
+			}),
+		),
+		HttpRouter.add("GET", "/debug/registry", () =>
+			Effect.gen(function* () {
+				const sql = yield* SqlClient.SqlClient;
+				const runners = yield* sql`
           SELECT machine_id, address, runner, healthy
           FROM cluster_runners
           ORDER BY machine_id
         `;
-        const locks = yield* sql`
+				const locks = yield* sql`
           SELECT shard_id, address, acquired_at
           FROM cluster_locks
           ORDER BY shard_id
         `;
-        return yield* HttpServerResponse.json({ runners, locks });
-      }),
-    ),
-    HttpRouter.add("GET", "/debug/mailbox", () =>
-      Effect.gen(function* () {
-        const sql = yield* SqlClient.SqlClient;
-        const [messageCount, pendingCount, replyCount, messageRows, replyRows] = yield* Effect.all(
-          [
-            sql`SELECT COUNT(*) AS count FROM cluster_messages`,
-            sql`SELECT COUNT(*) AS count FROM cluster_messages WHERE processed = FALSE`,
-            sql`SELECT COUNT(*) AS count FROM cluster_replies`,
-            sql`SELECT id, request_id FROM cluster_messages ORDER BY id DESC LIMIT 20`,
-            sql`SELECT id, request_id, kind, sequence FROM cluster_replies ORDER BY id DESC LIMIT 20`,
-          ],
-          { concurrency: 5 },
-        );
-        return yield* HttpServerResponse.json({
-          messages: Number(messageCount[0]?.count ?? 0),
-          pendingMessages: Number(pendingCount[0]?.count ?? 0),
-          replies: Number(replyCount[0]?.count ?? 0),
-          messageRows: messageRows.map((row) => ({
-            id: String(row.id),
-            request_id: String(row.request_id),
-          })),
-          replyRows: replyRows.map((row) => ({
-            id: String(row.id),
-            request_id: String(row.request_id),
-            kind: row.kind,
-            sequence: row.sequence,
-          })),
-        });
-      }),
-    ),
-  );
+				return yield* HttpServerResponse.json({ runners, locks });
+			}),
+		),
+		HttpRouter.add("GET", "/debug/mailbox", () =>
+			Effect.gen(function* () {
+				const sql = yield* SqlClient.SqlClient;
+				const [messageCount, pendingCount, replyCount, messageRows, replyRows] = yield* Effect.all(
+					[
+						sql`SELECT COUNT(*) AS count FROM cluster_messages`,
+						sql`SELECT COUNT(*) AS count FROM cluster_messages WHERE processed = FALSE`,
+						sql`SELECT COUNT(*) AS count FROM cluster_replies`,
+						sql`SELECT id, request_id FROM cluster_messages ORDER BY id DESC LIMIT 20`,
+						sql`SELECT id, request_id, kind, sequence FROM cluster_replies ORDER BY id DESC LIMIT 20`,
+					],
+					{ concurrency: 5 },
+				);
+				return yield* HttpServerResponse.json({
+					messages: Number(messageCount[0]?.count ?? 0),
+					pendingMessages: Number(pendingCount[0]?.count ?? 0),
+					replies: Number(replyCount[0]?.count ?? 0),
+					messageRows: messageRows.map((row) => ({
+						id: String(row.id),
+						request_id: String(row.request_id),
+					})),
+					replyRows: replyRows.map((row) => ({
+						id: String(row.id),
+						request_id: String(row.request_id),
+						kind: row.kind,
+						sequence: row.sequence,
+					})),
+				});
+			}),
+		),
+	);
 
-  return routes.pipe(Layer.provideMerge(counter));
+	return routes.pipe(Layer.provideMerge(counter), Layer.provideMerge(workflow));
 };
 
+const makeClientLayer = (env) => {
+	const shardingConfig = ShardingConfig.layer({
+		shardsPerGroup: shardCount,
+		refreshAssignmentsInterval: Duration.millis(500),
+		shardLockDisableAdvisory: true,
+	});
+	const database = PgClient.layer({
+		url: Redacted.make(env.CLUSTER_DB.connectionString),
+		maxConnections: 4,
+		minConnections: 0,
+	});
+	const clusterStorage = Layer.mergeAll(SqlRunnerStorage.layer, BoundedMessageStorageLayer).pipe(
+		Layer.provideMerge(Layer.mergeAll(shardingConfig, database, cryptoLayer)),
+	);
+	const clientFetch = makeRunnerFetchLayer(env.COUNTER_RUNNER);
+	const clientCluster = HttpRunner.layerHttpClientOnly.pipe(
+		Layer.provideMerge(
+			Layer.mergeAll(clusterStorage, RpcSerialization.layerSchemaBinary(), clientFetch),
+		),
+	);
+	const workflowEngine = ClusterWorkflowEngine.layer.pipe(Layer.provideMerge(clientCluster));
+	const routes = Layer.mergeAll(
+		HttpRouter.add("POST", "/workflow/execute", (request) =>
+			Effect.gen(function* () {
+				const url = new URL(request.url, "http://client.local");
+				const operationId = url.searchParams.get("operationId");
+				const entityId = url.searchParams.get("id");
+				if (!operationId || !entityId) {
+					return yield* HttpServerResponse.json(
+						{ error: "operationId and id are required" },
+						{ status: 400 },
+					);
+				}
+				const payload = { operationId, entityId };
+				const executionId = yield* CounterWorkflow.executionId(payload);
+				const result = yield* CounterWorkflow.execute(payload);
+				return yield* HttpServerResponse.json({ executionId, result });
+			}),
+		),
+	);
+
+	return routes.pipe(Layer.provideMerge(workflowEngine));
+};
+
+const clientHandlerFor = (env) => HttpRouter.toWebHandler(makeClientLayer(env));
+
 const runnerRequest = (request, runnerId) => {
-  const url = new URL(request.url);
-  const target = new URL(
-    `${url.pathname}${url.search}`,
-    `http://${runnerId}${runnerHostSuffix}:8787`,
-  );
-  const headers = new Headers(request.headers);
-  headers.set("x-cluster-runner-id", runnerId);
-  const init = { method: request.method, headers };
-  if (request.body && request.method !== "GET" && request.method !== "HEAD") {
-    init.body = request.body;
-    init.duplex = "half";
-  }
-  return new Request(target, init);
+	const url = new URL(request.url);
+	const target = new URL(
+		`${url.pathname}${url.search}`,
+		`http://${runnerId}${runnerHostSuffix}:8787`,
+	);
+	const headers = new Headers(request.headers);
+	headers.set("x-cluster-runner-id", runnerId);
+	const init = { method: request.method, headers };
+	if (request.body && request.method !== "GET" && request.method !== "HEAD") {
+		init.body = request.body;
+		init.duplex = "half";
+	}
+	return new Request(target, init);
 };
 
 const fetchRunner = (env, runnerId, request) =>
-  env.COUNTER_RUNNER.getByName(runnerId).fetch(runnerRequest(request, runnerId));
+	env.COUNTER_RUNNER.getByName(runnerId).fetch(runnerRequest(request, runnerId));
 
 export class CounterRunner extends DurableObject {
-  constructor(ctx, env) {
-    super(ctx, env);
-    this.env = env;
-    this.runnerId = undefined;
-    this.handler = undefined;
-    this.ctx.storage.sql.exec(
-      "CREATE TABLE IF NOT EXISTS counter (entity_id TEXT PRIMARY KEY, value INTEGER NOT NULL)",
-    );
-  }
+	constructor(ctx, env) {
+		super(ctx, env);
+		this.env = env;
+		this.runnerId = undefined;
+		this.handler = undefined;
+		this.startup = undefined;
+		this.ctx.storage.sql.exec(
+			"CREATE TABLE IF NOT EXISTS counter (entity_id TEXT PRIMARY KEY, value INTEGER NOT NULL)",
+		);
+	}
 
-  fetch(request) {
-    const runnerId = request.headers.get("x-cluster-runner-id");
-    if (!runnerIds.includes(runnerId))
-      return new Response("Runner identity required", { status: 400 });
-    if (this.runnerId && this.runnerId !== runnerId)
-      return new Response("Runner identity mismatch", { status: 409 });
-    if (!this.handler) {
-      this.runnerId = runnerId;
-      this.handler = HttpRouter.toWebHandler(
-        makeRunnerLayer({ storage: this.ctx.storage, env: this.env, runnerId }),
-        { disableLogger: true },
-      );
-    }
+	async fetch(request) {
+		const runnerId = request.headers.get("x-cluster-runner-id");
+		if (!runnerIds.includes(runnerId))
+			return new Response("Runner identity required", { status: 400 });
+		if (this.runnerId && this.runnerId !== runnerId)
+			return new Response("Runner identity mismatch", { status: 409 });
+		if (!this.handler) {
+			this.runnerId = runnerId;
+			this.handler = HttpRouter.toWebHandler(
+				makeRunnerLayer({ storage: this.ctx.storage, env: this.env, runnerId }),
+				{ disableLogger: true },
+			);
+			this.startup = this.handler.handler(
+				new Request("http://internal/internal/startup-recovery", { method: "POST" }),
+			);
+		}
 
-    return this.handler.handler(request);
-  }
+		const startupResponse = await this.startup;
+		if (!startupResponse.ok) return startupResponse;
+		return this.handler.handler(request);
+	}
 }
 
 export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    if (url.pathname === "/prepare" && request.method === "POST") {
-      for (const runnerId of runnerIds) {
-        await fetchRunner(env, runnerId, new Request("http://internal/health"));
-      }
-      const deadline = Date.now() + 15_000;
-      let status;
-      let assignments;
-      let consistent = false;
-      do {
-        const [statusResponse, ...assignmentResponses] = await Promise.all([
-          fetchRunner(env, runnerIds[0], new Request("http://internal/debug/registry")),
-          ...runnerIds.map((runnerId) =>
-            fetchRunner(env, runnerId, new Request("http://internal/debug/assignments")),
-          ),
-        ]);
-        status = await statusResponse.json();
-        assignments = await Promise.all(assignmentResponses.map((response) => response.json()));
-        const assignmentOwners = new Map();
-        for (const assignment of assignments) {
-          for (const shardId of assignment.ownedShardIds)
-            assignmentOwners.set(shardId, assignment.runnerId);
-        }
-        const registeredRunners = new Set(
-          status.runners.map((runner) => runner.address.split(".")[0]),
-        );
-        const lockOwners = new Map(
-          status.locks.map((lock) => [lock.shard_id, lock.address.split(".")[0]]),
-        );
-        consistent =
-          runnerIds.every((runnerId) => registeredRunners.has(runnerId)) &&
-          assignments.every((assignment) => assignment.ownedShardIds.length > 0) &&
-          assignmentOwners.size === shardCount &&
-          Array.from(assignmentOwners).every(
-            ([shardId, runnerId]) => lockOwners.get(shardId) === runnerId,
-          );
-        if (consistent) break;
-        await new Promise((resolve) => setTimeout(resolve, 250));
-      } while (Date.now() < deadline);
-      return Response.json(
-        { ready: consistent, ...status, assignments },
-        { status: consistent ? 200 : 503 },
-      );
-    }
-    if (url.pathname === "/debug/registry" && request.method === "GET") {
-      return fetchRunner(env, runnerIds[0], new Request("http://internal/debug/registry"));
-    }
-    if (url.pathname === "/debug/mailbox" && request.method === "GET") {
-      return fetchRunner(env, runnerIds[0], new Request("http://internal/debug/mailbox"));
-    }
-    if (url.pathname === "/debug/storage" && request.method === "GET") {
-      const runnerId = url.searchParams.get("runner") ?? runnerIds[0];
-      if (!runnerIds.includes(runnerId)) return new Response("Unknown runner", { status: 400 });
-      const storageUrl = new URL("http://internal/debug/storage");
-      const entityId = url.searchParams.get("id");
-      if (entityId !== null) storageUrl.searchParams.set("id", entityId);
-      return fetchRunner(env, runnerId, new Request(storageUrl));
-    }
-    if (["/health", "/increment", "/debug/shard", "/debug/assignments"].includes(url.pathname)) {
-      const runnerId = url.searchParams.get("via") ?? runnerIds[0];
-      if (!runnerIds.includes(runnerId)) return new Response("Unknown runner", { status: 400 });
-      return fetchRunner(env, runnerId, request);
-    }
-    return new Response("Not found", { status: 404 });
-  },
+	async fetch(request, env) {
+		const url = new URL(request.url);
+		if (url.pathname === "/workflow/execute" && request.method === "POST") {
+			return clientHandlerFor(env).handler(request);
+		}
+		if (url.pathname === "/workflow/poll" && request.method === "GET") {
+			return fetchRunner(env, runnerIds[0], request);
+		}
+		if (url.pathname === "/task/prepare-recovery" && request.method === "POST") {
+			return fetchRunner(env, runnerIds[0], request);
+		}
+		if (url.pathname === "/task/status" && request.method === "GET") {
+			return fetchRunner(env, runnerIds[0], request);
+		}
+		if (url.pathname === "/debug/workflow-counter" && request.method === "GET") {
+			return fetchRunner(env, runnerIds[0], request);
+		}
+		if (url.pathname === "/prepare" && request.method === "POST") {
+			await Promise.all(
+				runnerIds.map((runnerId) =>
+					fetchRunner(env, runnerId, new Request("http://internal/health")),
+				),
+			);
+			const deadline = Date.now() + 15_000;
+			let status;
+			let assignments;
+			let consistent = false;
+			do {
+				const [statusResponse, ...assignmentResponses] = await Promise.all([
+					fetchRunner(env, runnerIds[0], new Request("http://internal/debug/registry")),
+					...runnerIds.map((runnerId) =>
+						fetchRunner(env, runnerId, new Request("http://internal/debug/assignments")),
+					),
+				]);
+				status = await statusResponse.json();
+				assignments = await Promise.all(assignmentResponses.map((response) => response.json()));
+				const assignmentOwners = new Map();
+				for (const assignment of assignments) {
+					for (const shardId of assignment.ownedShardIds)
+						assignmentOwners.set(shardId, assignment.runnerId);
+				}
+				const registeredRunners = new Set(
+					status.runners.map((runner) => runner.address.split(".")[0]),
+				);
+				const lockOwners = new Map(
+					status.locks.map((lock) => [lock.shard_id, lock.address.split(".")[0]]),
+				);
+				consistent =
+					runnerIds.every((runnerId) => registeredRunners.has(runnerId)) &&
+					assignments.every((assignment) => assignment.ownedShardIds.length > 0) &&
+					assignmentOwners.size === shardCount &&
+					Array.from(assignmentOwners).every(
+						([shardId, runnerId]) => lockOwners.get(shardId) === runnerId,
+					);
+				if (consistent) break;
+				await new Promise((resolve) => setTimeout(resolve, 250));
+			} while (Date.now() < deadline);
+			return Response.json(
+				{ ready: consistent, ...status, assignments },
+				{ status: consistent ? 200 : 503 },
+			);
+		}
+		if (url.pathname === "/debug/registry" && request.method === "GET") {
+			return fetchRunner(env, runnerIds[0], new Request("http://internal/debug/registry"));
+		}
+		if (url.pathname === "/debug/mailbox" && request.method === "GET") {
+			return fetchRunner(env, runnerIds[0], new Request("http://internal/debug/mailbox"));
+		}
+		if (url.pathname === "/debug/storage" && request.method === "GET") {
+			const runnerId = url.searchParams.get("runner") ?? runnerIds[0];
+			if (!runnerIds.includes(runnerId)) return new Response("Unknown runner", { status: 400 });
+			const storageUrl = new URL("http://internal/debug/storage");
+			const entityId = url.searchParams.get("id");
+			if (entityId !== null) storageUrl.searchParams.set("id", entityId);
+			return fetchRunner(env, runnerId, new Request(storageUrl));
+		}
+		if (["/health", "/increment", "/debug/shard", "/debug/assignments"].includes(url.pathname)) {
+			const runnerId = url.searchParams.get("via") ?? runnerIds[0];
+			if (!runnerIds.includes(runnerId)) return new Response("Unknown runner", { status: 400 });
+			return fetchRunner(env, runnerId, request);
+		}
+		return new Response("Not found", { status: 404 });
+	},
 };
