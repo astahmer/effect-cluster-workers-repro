@@ -43,6 +43,31 @@ pnpm run prove -- https://effect-cluster-workers-repro.astahmer.workers.dev
 
 The deployed URL is <https://effect-cluster-workers-repro.astahmer.workers.dev>. This Worker is the standalone demo only; it does not deploy Emisoup.
 
+## PostgreSQL-backed Worker variant
+
+`wrangler.pg.toml` starts the same two Durable Object runners with Effect's SQL-backed `SqlRunnerStorage` and `SqlMessageStorage`. Both runners share PostgreSQL tables for registration, row-based shard leases, mailbox messages, and replies. `shardLockDisableAdvisory` is enabled because Hyperdrive does not support PostgreSQL advisory locks. The entity counter remains in each runner's Durable Object SQLite storage so this stays a small transport and recovery proof.
+
+Cloudflare Workers can open outbound TCP connections, which lets the PG client reach a database. They do not accept inbound TCP connections, while `NodeClusterSocket` provides a TCP listener for runner RPC. The Worker variant therefore uses Effect's HTTP runner transport between Durable Objects and keeps the same SQL cluster stores.
+
+For local runs, create a separate PostgreSQL database and owner role, then put its connection string in the ignored `.pg-repro.env` file:
+
+```sh
+CLOUDFLARE_HYPERDRIVE_LOCAL_CONNECTION_STRING_CLUSTER_DB=postgresql://<role>:<password>@127.0.0.1:5438/<database>?sslmode=disable
+```
+
+Start the Worker and run the shared proof script:
+
+```sh
+set -a
+source .pg-repro.env
+set +a
+pnpm dev:pg
+```
+
+In another terminal, run `pnpm prove -- http://localhost:8790`. Stop and restart Wrangler with the same persistence path and database, then run `pnpm prove -- http://localhost:8790 --require-existing` to require the prior mailbox and counter records.
+
+The Hyperdrive ID in `wrangler.pg.toml` is a local-only placeholder. This variant has not been deployed or tested through a real Hyperdrive pooler; local proof connects directly to PostgreSQL. Before any PG deployment, use a disposable database, replace the placeholder with its Hyperdrive configuration, and verify the installed `@effect/sql-pg` protocol against that Hyperdrive. Each active runner also holds a reserved SQL connection for row-based lease operations, so connection use must be checked at the intended runner count.
+
 ## Limits
 
 - Restarting Wrangler against the same local persistence path checks reconstruction from persisted storage. It does not force one specific Durable Object eviction.
