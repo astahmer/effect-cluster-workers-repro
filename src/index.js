@@ -278,23 +278,26 @@ const makeRunnerLayer = ({ storage, env, runnerId }) => {
         return yield* HttpServerResponse.json({ runnerId, ownedShardIds });
       }),
     ),
-    HttpRouter.add(
-      "GET",
-      "/debug/storage",
+    HttpRouter.add("GET", "/debug/storage", (request) =>
       Effect.gen(function* () {
         const runnerStorage = yield* RunnerStorage.RunnerStorage;
         const runners = yield* runnerStorage.getRunners;
-        const count = (sql) => Number(storage.sql.exec(sql).one().count);
+        const entityId = new URL(request.url, "http://runner.local").searchParams.get("id");
+        const counterRows =
+          entityId === null
+            ? storage.sql
+                .exec("SELECT entity_id, value FROM counter ORDER BY entity_id LIMIT 50")
+                .toArray()
+            : storage.sql
+                .exec("SELECT entity_id, value FROM counter WHERE entity_id = ?", entityId)
+                .toArray();
         return yield* HttpServerResponse.json({
           runnerId,
           runners: runners.map(([runner, healthy]) => ({
             address: runner.address.toString(),
             healthy,
           })),
-          counterEntities: count("SELECT count(*) AS count FROM counter"),
-          counterRows: storage.sql
-            .exec("SELECT entity_id, value FROM counter ORDER BY entity_id")
-            .toArray(),
+          counterRows,
           mailbox: "cluster-mailbox",
         });
       }),
@@ -672,7 +675,10 @@ export default {
     if (url.pathname === "/debug/storage" && request.method === "GET") {
       const runnerId = url.searchParams.get("runner") ?? runnerIds[0];
       if (!runnerIds.includes(runnerId)) return new Response("Unknown runner", { status: 400 });
-      return fetchRunner(env, runnerId, new Request("http://internal/debug/storage"));
+      const storageUrl = new URL("http://internal/debug/storage");
+      const entityId = url.searchParams.get("id");
+      if (entityId !== null) storageUrl.searchParams.set("id", entityId);
+      return fetchRunner(env, runnerId, new Request(storageUrl));
     }
     if (["/health", "/increment", "/debug/shard", "/debug/assignments"].includes(url.pathname)) {
       const runnerId = url.searchParams.get("via") ?? runnerIds[0];

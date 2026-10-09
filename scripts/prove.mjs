@@ -40,7 +40,9 @@ assert.ok(routedEntity, "find an entity owned by runner 1 for a request entering
 
 const [mailboxBefore, counterBefore] = await Promise.all([
   requestJson("/debug/mailbox"),
-  requestJson(`/debug/storage?runner=${runner1.runnerId}`),
+  requestJson(
+    `/debug/storage?runner=${runner1.runnerId}&id=${encodeURIComponent(routedEntity.entityId)}`,
+  ),
 ]);
 
 const previousValue = counterBefore.counterRows.find(
@@ -62,7 +64,9 @@ if (previousValue !== undefined) assert.equal(result.value, previousValue + 1);
 
 const [mailboxAfter, counterAfter] = await Promise.all([
   requestJson("/debug/mailbox"),
-  requestJson(`/debug/storage?runner=${runner1.runnerId}`),
+  requestJson(
+    `/debug/storage?runner=${runner1.runnerId}&id=${encodeURIComponent(routedEntity.entityId)}`,
+  ),
 ]);
 
 assert.equal(mailboxAfter.messages, mailboxBefore.messages + 1);
