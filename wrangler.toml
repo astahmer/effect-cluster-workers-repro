@@ -1,0 +1,11 @@
+name = "effect-cluster-workers-repro"
+main = "src/index.js"
+compatibility_date = "2026-10-09"
+
+[[durable_objects.bindings]]
+name = "COUNTER_RUNNER"
+class_name = "CounterRunner"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CounterRunner"]
