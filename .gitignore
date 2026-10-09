@@ -2,3 +2,4 @@ node_modules/
 .wrangler/
 .pg-repro.env
 .dev.vars
+.jj
