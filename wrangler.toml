@@ -6,6 +6,22 @@ compatibility_date = "2026-10-09"
 name = "COUNTER_RUNNER"
 class_name = "CounterRunner"
 
+[[durable_objects.bindings]]
+name = "CLUSTER_REGISTRY"
+class_name = "ClusterRegistry"
+
+[[durable_objects.bindings]]
+name = "CLUSTER_MAILBOX"
+class_name = "ClusterMailbox"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["CounterRunner"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["ClusterRegistry"]
+
+[[migrations]]
+tag = "v3"
+new_sqlite_classes = ["ClusterMailbox"]

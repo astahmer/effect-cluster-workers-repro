@@ -3,12 +3,13 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "wrangler dev",
+    "dev:proof": "wrangler dev --persist-to .wrangler/proof-state",
+    "prove": "node scripts/prove.mjs",
     "deploy": "wrangler deploy",
     "deploy:check": "wrangler deploy --dry-run"
   },
   "dependencies": {
-    "effect": "4.0.0-beta.107"
+    "effect": "4.0.2"
   },
   "devDependencies": {
     "wrangler": "4.148.0"
