@@ -1,16 +1,18 @@
 # Effect Cluster on Cloudflare Workers: minimal runner proof
 
-A single Cloudflare Worker routes requests to one named Durable Object. The Durable Object hosts an Effect Cluster `Entity` and increments a value stored in its SQLite storage.
+A Cloudflare Worker forwards requests to one named Durable Object. That Durable Object hosts one Effect Cluster runner using Effect's HTTP runner protocol and serves a `Counter` entity from its fetch handler. The entity increments a value in Durable Object SQLite storage.
 
 ```sh
 pnpm install
 pnpm dev
 curl -X POST http://localhost:8787/increment
-curl -X POST http://localhost:8787/increment
+curl http://localhost:8787/health
 ```
 
-The response should advance from `1` to `2`. This exercises Worker-to-DO RPC, Effect Cluster entity sharding/client dispatch, and durable state across requests.
+`/increment` should return `1`, then `2`. The same counter value survives a Wrangler restart because it is stored in Durable Object SQLite. The Effect entity uses in-process sharding and actor dispatch, while `/cluster` is the HTTP runner route exposed by `HttpRunner.layerHttpOptions`.
 
-Deploy with `pnpm deploy`. The Durable Object class is introduced by the `v1` migration in `wrangler.toml`.
+Deploy with `pnpm run deploy`. The Durable Object class is introduced by the `v1` migration in `wrangler.toml`.
 
-This is deliberately a single-runner example. It uses Effect's `TestRunner.layer` for in-process sharding and message/runner storage. It does not prove cross-runner communication over `HttpRunner`, coordination among multiple Durable Objects, or recovery of Effect Cluster's internal mailbox state after eviction. Only the counter value is persisted in the Durable Object's SQLite storage.
+The deployed proof is at <https://effect-cluster-workers-repro.astahmer.workers.dev>. Its `/increment` endpoint changes only this demo Durable Object's counter.
+
+This is a deliberately small, single-runner proof. Runner and mailbox metadata use Effect's in-memory storage adapters; only the counter value survives Durable Object eviction. It demonstrates a real Effect Cluster entity running inside a deployed Durable Object, but does not prove cross-runner sharding, inter-DO HTTP RPC, durable mailbox recovery after eviction, or production task execution. A multi-runner version still needs durable shared `RunnerStorage` and `MessageStorage` plus an address-to-Durable-Object transport adapter.
