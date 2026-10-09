@@ -4,7 +4,7 @@ This repository has a small Durable Objects demo and a PostgreSQL-backed Effect 
 
 ## PostgreSQL proof
 
-The proof starts two named Durable Objects as runners, assigns 32 shards, and checks runner registration, health pings, shard leases, runner-to-runner RPC, PostgreSQL mailbox claims, workflow execution, and task recovery after a restart. The workflow activity writes a sample fact to PostgreSQL; the RPC counter remains in Durable Object SQLite so the two storage boundaries are visible.
+The proof starts two named Durable Objects as runners, assigns 32 shards, and checks runner registration, health pings, shard leases, runner-to-runner RPC, PostgreSQL mailbox claims, workflow execution, and task recovery after a restart. Its recovery proof also interrupts one runner after an Activity commits a PostgreSQL effect but before the Activity returns. The surviving runner takes over the expired shards, retries the Activity, and keeps the effect count at one through a stable operation key. The RPC counter remains in Durable Object SQLite so both storage boundaries are visible.
 
 For the Emisoup comparison, version results, exact differences, and remaining proof work, see [the capability parity notes](docs/capability-parity.md).
 
@@ -31,6 +31,12 @@ set +a
 pnpm dev:pg
 ```
 
+The runner-interruption proof uses the ignored `.dev.vars` file to enable local-only reset controls:
+
+```sh
+REPRO_TEST_CONTROLS=local-only
+```
+
 In another terminal, run the first proof:
 
 ```sh
@@ -44,6 +50,14 @@ pnpm prove -- http://localhost:8790 --require-existing
 ```
 
 The second run requires existing mailbox and Durable Object counter rows, checks the completed workflow result and PostgreSQL activity counter, and verifies that runner startup recovered the staged active task. The proof script also repeats a workflow request in one Worker process to check idempotent replay.
+
+While Wrangler is running, interrupt one runner during an in-flight workflow Activity:
+
+```sh
+pnpm prove:runner-recovery -- http://localhost:8790
+```
+
+This takes about 35 seconds because the remaining runner must observe the 30-second shard lease expiry. Wrangler logs one expected `ctx.abort()` error. The script verifies that only the selected Durable Object is reconstructed, all 32 shards fail over, the committed PostgreSQL effect is not repeated, and the task ledger completes when the runner returns.
 
 Stop Wrangler before running the independent mailbox claim exercise:
 
