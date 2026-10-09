@@ -9,6 +9,7 @@
     "deploy:check": "wrangler deploy --dry-run"
   },
   "dependencies": {
+    "@effect/sql-pg": "4.0.2",
     "effect": "4.0.2"
   },
   "devDependencies": {
