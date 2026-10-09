@@ -1,18 +1,52 @@
-# Effect Cluster on Cloudflare Workers: minimal runner proof
+# Effect Cluster on Cloudflare Workers
 
-A Cloudflare Worker forwards requests to one named Durable Object. That Durable Object hosts one Effect Cluster runner using Effect's HTTP runner protocol and serves a `Counter` entity from its fetch handler. The entity increments a value in Durable Object SQLite storage.
+Minimal proof of two Effect Cluster runners hosted by separate named Durable Objects, with a durable registry and mailbox in their own Durable Objects.
+
+## What it proves
+
+- `/prepare` starts both runners and waits until all 32 shards have one matching registry lock owner.
+- `/increment` enters through runner 0. The proof script selects an entity owned by runner 1 and checks that the RPC handler runs there.
+- Runner registration and shard locks live in the registry Durable Object's SQLite storage.
+- Cluster requests and replies live in the mailbox Durable Object's SQLite storage. Snowflake IDs are stored as `TEXT` because the IDs exceed JavaScript's exact integer range.
+- Counter values live in each runner's SQLite storage.
+
+The custom mailbox driver also encodes shard IDs explicitly across the Durable Object RPC boundary. The stock SQLite adapter rounded Snowflake IDs when converting SQLite integers to JavaScript numbers, so a caller could wait for a different reply ID than the mailbox had stored.
+
+## Local proof
 
 ```sh
 pnpm install
-pnpm dev
-curl -X POST http://localhost:8787/increment
-curl http://localhost:8787/health
+pnpm dev:proof
 ```
 
-`/increment` should return `1`, then `2`. The same counter value survives a Wrangler restart because it is stored in Durable Object SQLite. The Effect entity uses in-process sharding and actor dispatch, while `/cluster` is the HTTP runner route exposed by `HttpRunner.layerHttpOptions`.
+In another terminal:
 
-Deploy with `pnpm run deploy`. The Durable Object class is introduced by the `v1` migration in `wrangler.toml`.
+```sh
+pnpm prove
+```
 
-The deployed proof is at <https://effect-cluster-workers-repro.astahmer.workers.dev>. Its `/increment` endpoint changes only this demo Durable Object's counter.
+The script checks shard ownership, runner-0-to-runner-1 RPC, the persisted counter, and a matched mailbox request/reply. Stop Wrangler with Ctrl-C, then start it again with `pnpm dev:proof` so it reuses `.wrangler/proof-state`. Run:
 
-This is a deliberately small, single-runner proof. Runner and mailbox metadata use Effect's in-memory storage adapters; only the counter value survives Durable Object eviction. It demonstrates a real Effect Cluster entity running inside a deployed Durable Object, but does not prove cross-runner sharding, inter-DO HTTP RPC, durable mailbox recovery after eviction, or production task execution. A multi-runner version still needs durable shared `RunnerStorage` and `MessageStorage` plus an address-to-Durable-Object transport adapter.
+```sh
+pnpm run prove -- --require-existing
+```
+
+This second run requires the registry, mailbox, and counter records from the prior process to exist before it sends another request.
+
+## Deploy the demo Worker
+
+```sh
+pnpm run deploy:check
+pnpm run deploy
+pnpm run prove -- https://effect-cluster-workers-repro.astahmer.workers.dev
+```
+
+The deployed URL is <https://effect-cluster-workers-repro.astahmer.workers.dev>. This Worker is the standalone demo only; it does not deploy Emisoup.
+
+## Limits
+
+- Restarting Wrangler against the same local persistence path checks reconstruction from persisted storage. It does not force one specific Durable Object eviction.
+- `/prepare` activates both runners and checks ownership; it does not keep their in-memory Effect runtimes alive forever.
+- One mailbox Durable Object is a shared throughput bottleneck in this proof.
+- The 32-shard counter is a transport and recovery proof, not a production exactly-once or task-execution contract.
+- Debug routes expose bounded metadata only; reply payloads are not returned.
