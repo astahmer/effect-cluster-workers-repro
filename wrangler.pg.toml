@@ -1,0 +1,15 @@
+name = "effect-cluster-workers-pg"
+main = "src/index-pg.js"
+compatibility_date = "2026-10-09"
+
+[[durable_objects.bindings]]
+name = "COUNTER_RUNNER"
+class_name = "CounterRunner"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["CounterRunner"]
+
+[[hyperdrive]]
+binding = "CLUSTER_DB"
+id = "00000000000000000000000000000000"

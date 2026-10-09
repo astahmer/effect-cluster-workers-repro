@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "dev:proof": "wrangler dev --persist-to .wrangler/proof-state",
+    "dev:pg": "wrangler dev --config wrangler.pg.toml --port 8790 --persist-to .wrangler/pg-proof-state",
     "prove": "node scripts/prove.mjs",
     "deploy": "wrangler deploy",
     "deploy:check": "wrangler deploy --dry-run"
