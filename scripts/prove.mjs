@@ -15,8 +15,8 @@ const requestJson = async (path, init) => {
 const preparation = await requestJson("/prepare", { method: "POST" });
 assert.equal(preparation.ready, true, "all shard locks must match their assigned runner");
 
-const recoveryTaskId = "workers-repro-startup-recovery-proof-v4";
-const recoveryEntityId = "workers-repro-startup-recovery-counter-v4";
+const recoveryTaskId = "workers-repro-startup-recovery-proof-v6";
+const recoveryEntityId = "workers-repro-startup-recovery-counter-v6";
 const recoveryTaskBefore = await requestJson(
 	`/task/status?taskId=${encodeURIComponent(recoveryTaskId)}`,
 );
@@ -113,10 +113,10 @@ const persistedCounter = counterAfter.counterRows.find(
 assert.equal(persistedCounter?.value, result.value);
 
 const workflowExecutionPath =
-	"/workflow/execute?operationId=workers-repro-postgres-workflow-proof-v6&id=workflow-postgres-counter-proof-v1";
+	"/workflow/execute?operationId=workers-repro-postgres-workflow-proof-v8&id=workflow-postgres-counter-proof-v2";
 const workflowExecution = await requestJson(workflowExecutionPath, { method: "POST" });
 assert.ok(workflowExecution.executionId);
-assert.equal(workflowExecution.result.entityId, "workflow-postgres-counter-proof-v1");
+assert.equal(workflowExecution.result.entityId, "workflow-postgres-counter-proof-v2");
 assert.equal(workflowExecution.result.value, 1, "idempotent workflow must increment only once");
 const workflowReplay = await requestJson(workflowExecutionPath, { method: "POST" });
 assert.equal(workflowReplay.executionId, workflowExecution.executionId);
@@ -129,6 +129,11 @@ const persistedWorkflowCounter = await requestJson(
 	`/debug/workflow-counter?id=${encodeURIComponent(workflowExecution.result.entityId)}`,
 );
 assert.equal(persistedWorkflowCounter.value, workflowExecution.result.value);
+const workflowAttempts = await requestJson(
+	`/debug/workflow-attempts?operationId=${encodeURIComponent("workers-repro-postgres-workflow-proof-v8")}`,
+);
+assert.equal(workflowAttempts.attempt.attempts, 1);
+assert.equal(workflowAttempts.effects.length, 1);
 
 if (!requireExisting) {
 	const pendingRecoveryTask = await requestJson(
@@ -157,6 +162,7 @@ console.log(
 			workflowReplayValue: workflowReplay.result.value,
 			workflowPollState: workflowPoll.state,
 			persistedWorkflowCounter: persistedWorkflowCounter.value,
+			workflowActivityAttempts: workflowAttempts.attempt.attempts,
 			startupRecoveryTaskStatus: recoveryTaskBefore.status,
 			startupRecoveryTaskResult: recoveryTaskBefore.result ?? null,
 			startupRecoveryCounterBefore: recoveryCounterBefore.value,

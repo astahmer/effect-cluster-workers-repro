@@ -41,7 +41,11 @@ const CounterWorkflowResult = Schema.Struct({
 });
 
 const CounterWorkflow = Workflow.make("CounterWorkflow", {
-	payload: Schema.Struct({ operationId: Schema.String, entityId: Schema.String }),
+	payload: Schema.Struct({
+		operationId: Schema.String,
+		entityId: Schema.String,
+		holdAfterEffectMs: Schema.optional(Schema.Number),
+	}),
 	success: CounterWorkflowResult,
 	idempotencyKey: ({ operationId }) => operationId,
 });
@@ -66,6 +70,25 @@ const ensureWorkflowCounterTable = (sql) =>
 			runner_id TEXT NOT NULL
 		)
 	`;
+
+const ensureWorkflowReliabilityTables = (sql) =>
+	Effect.all([
+		sql`
+			CREATE TABLE IF NOT EXISTS workers_repro_workflow_effects (
+				operation_id TEXT PRIMARY KEY,
+				entity_id TEXT NOT NULL,
+				runner_id TEXT NOT NULL
+			)
+		`,
+		sql`
+			CREATE TABLE IF NOT EXISTS workers_repro_workflow_attempts (
+				operation_id TEXT PRIMARY KEY,
+				attempts INTEGER NOT NULL,
+				last_runner_id TEXT NOT NULL,
+				phase TEXT NOT NULL CHECK (phase IN ('started', 'effect-applied'))
+			)
+		`,
+	]);
 
 const makeRunnerFetchLayer = (namespace) => {
 	const fetchRunner = async (input, init) => {
@@ -141,19 +164,57 @@ const makeRunnerLayer = ({ storage, env, runnerId }) => {
 				execute: Effect.gen(function* () {
 					const sql = yield* SqlClient.SqlClient;
 					yield* ensureWorkflowCounterTable(sql);
-					const rows = yield* sql`
-						INSERT INTO workers_repro_workflow_counter (entity_id, value, runner_id)
-						VALUES (${payload.entityId}, 1, ${runnerId})
-						ON CONFLICT (entity_id) DO UPDATE
-						SET value = workers_repro_workflow_counter.value + 1,
-							runner_id = EXCLUDED.runner_id
-						RETURNING value, runner_id
+					yield* ensureWorkflowReliabilityTables(sql);
+					const attempts = yield* sql`
+						INSERT INTO workers_repro_workflow_attempts (
+							operation_id, attempts, last_runner_id, phase
+						)
+						VALUES (${payload.operationId}, 1, ${runnerId}, 'started')
+						ON CONFLICT (operation_id) DO UPDATE
+						SET attempts = workers_repro_workflow_attempts.attempts + 1,
+							last_runner_id = EXCLUDED.last_runner_id,
+							phase = 'started'
+						RETURNING attempts
 					`;
-					return {
-						entityId: payload.entityId,
-						value: Number(rows[0].value),
-						runnerId: rows[0].runner_id,
-					};
+					const result = yield* sql.withTransaction(
+						Effect.gen(function* () {
+							const insertedEffect = yield* sql`
+								INSERT INTO workers_repro_workflow_effects (operation_id, entity_id, runner_id)
+								VALUES (${payload.operationId}, ${payload.entityId}, ${runnerId})
+								ON CONFLICT (operation_id) DO NOTHING
+								RETURNING operation_id
+							`;
+							if (insertedEffect.length > 0) {
+								yield* sql`
+									INSERT INTO workers_repro_workflow_counter (entity_id, value, runner_id)
+									VALUES (${payload.entityId}, 1, ${runnerId})
+									ON CONFLICT (entity_id) DO UPDATE
+									SET value = workers_repro_workflow_counter.value + 1,
+										runner_id = EXCLUDED.runner_id
+								`;
+							}
+							const rows = yield* sql`
+								SELECT value, runner_id
+								FROM workers_repro_workflow_counter
+								WHERE entity_id = ${payload.entityId}
+							`;
+							yield* sql`
+								UPDATE workers_repro_workflow_attempts
+								SET phase = 'effect-applied'
+								WHERE operation_id = ${payload.operationId}
+							`;
+							return {
+								entityId: payload.entityId,
+								value: Number(rows[0].value),
+								runnerId: rows[0].runner_id,
+							};
+						}),
+					);
+					const holdAfterEffectMs = payload.holdAfterEffectMs ?? 0;
+					if (Number(attempts[0].attempts) === 1 && holdAfterEffectMs > 0) {
+						yield* Effect.sleep(Duration.millis(holdAfterEffectMs));
+					}
+					return result;
 				}),
 			});
 			return yield* incrementCounter;
@@ -176,7 +237,11 @@ const makeRunnerLayer = ({ storage, env, runnerId }) => {
 					activeTasks,
 					(task) =>
 						Effect.gen(function* () {
-							const payload = { operationId: task.task_id, entityId: task.entity_id };
+							const payload = {
+								operationId: task.task_id,
+								entityId: task.entity_id,
+								holdAfterEffectMs: 0,
+							};
 							const existing = yield* CounterWorkflow.poll(task.execution_id);
 							const result = yield* CounterWorkflow.execute(payload);
 							yield* sql`
@@ -195,6 +260,38 @@ const makeRunnerLayer = ({ storage, env, runnerId }) => {
 				});
 			}),
 		),
+		HttpRouter.add("POST", "/task/dispatch-interrupted", (request) =>
+			Effect.gen(function* () {
+				if (env.REPRO_TEST_CONTROLS !== "local-only") {
+					return yield* HttpServerResponse.json({ error: "Not found" }, { status: 404 });
+				}
+				const url = new URL(request.url, "http://runner.local");
+				const taskId = url.searchParams.get("taskId");
+				const entityId = url.searchParams.get("id");
+				if (!taskId || !entityId) {
+					return yield* HttpServerResponse.json(
+						{ error: "taskId and id are required" },
+						{ status: 400 },
+					);
+				}
+				const payload = { operationId: taskId, entityId, holdAfterEffectMs: 30_000 };
+				const executionId = yield* CounterWorkflow.executionId(payload);
+				const sql = yield* SqlClient.SqlClient;
+				yield* ensureTaskTable(sql);
+				yield* sql`
+					INSERT INTO workers_repro_tasks (task_id, entity_id, execution_id, status, result, updated_at)
+					VALUES (${taskId}, ${entityId}, ${executionId}, 'running', NULL, NOW())
+					ON CONFLICT (task_id) DO UPDATE
+					SET entity_id = EXCLUDED.entity_id,
+						execution_id = EXCLUDED.execution_id,
+						status = 'running',
+						result = NULL,
+						updated_at = NOW()
+				`;
+				yield* CounterWorkflow.execute(payload, { discard: true });
+				return yield* HttpServerResponse.json({ taskId, executionId, status: "running" });
+			}),
+		),
 		HttpRouter.add("POST", "/task/prepare-recovery", (request) =>
 			Effect.gen(function* () {
 				const url = new URL(request.url, "http://runner.local");
@@ -208,7 +305,7 @@ const makeRunnerLayer = ({ storage, env, runnerId }) => {
 				}
 				const sql = yield* SqlClient.SqlClient;
 				yield* ensureTaskTable(sql);
-				const payload = { operationId: taskId, entityId };
+				const payload = { operationId: taskId, entityId, holdAfterEffectMs: 0 };
 				const executionId = yield* CounterWorkflow.executionId(payload);
 				yield* sql`
 					INSERT INTO workers_repro_tasks (task_id, entity_id, execution_id, status, result, updated_at)
@@ -255,6 +352,32 @@ const makeRunnerLayer = ({ storage, env, runnerId }) => {
 				return yield* HttpServerResponse.json(
 					rows[0] ?? { entity_id: entityId, value: null, runner_id: null },
 				);
+			}),
+		),
+		HttpRouter.add("GET", "/debug/workflow-attempts", (request) =>
+			Effect.gen(function* () {
+				const operationId = new URL(request.url, "http://runner.local").searchParams.get(
+					"operationId",
+				);
+				if (!operationId) {
+					return yield* HttpServerResponse.json(
+						{ error: "operationId is required" },
+						{ status: 400 },
+					);
+				}
+				const sql = yield* SqlClient.SqlClient;
+				yield* ensureWorkflowReliabilityTables(sql);
+				const attempts = yield* sql`
+					SELECT attempts, last_runner_id, phase
+					FROM workers_repro_workflow_attempts
+					WHERE operation_id = ${operationId}
+				`;
+				const effects = yield* sql`
+					SELECT operation_id, entity_id, runner_id
+					FROM workers_repro_workflow_effects
+					WHERE operation_id = ${operationId}
+				`;
+				return yield* HttpServerResponse.json({ attempt: attempts[0] ?? null, effects });
 			}),
 		),
 		HttpRouter.add("GET", "/workflow/poll", (request) =>
@@ -410,7 +533,7 @@ const makeClientLayer = (env) => {
 						{ status: 400 },
 					);
 				}
-				const payload = { operationId, entityId };
+				const payload = { operationId, entityId, holdAfterEffectMs: 0 };
 				const executionId = yield* CounterWorkflow.executionId(payload);
 				const result = yield* CounterWorkflow.execute(payload);
 				return yield* HttpServerResponse.json({ executionId, result });
@@ -449,6 +572,7 @@ export class CounterRunner extends DurableObject {
 		this.runnerId = undefined;
 		this.handler = undefined;
 		this.startup = undefined;
+		this.instanceId = crypto.randomUUID();
 		this.ctx.storage.sql.exec(
 			"CREATE TABLE IF NOT EXISTS counter (entity_id TEXT PRIMARY KEY, value INTEGER NOT NULL)",
 		);
@@ -460,6 +584,13 @@ export class CounterRunner extends DurableObject {
 			return new Response("Runner identity required", { status: 400 });
 		if (this.runnerId && this.runnerId !== runnerId)
 			return new Response("Runner identity mismatch", { status: 409 });
+		const url = new URL(request.url);
+		if (url.pathname === "/debug/abort" && request.method === "POST") {
+			if (this.env.REPRO_TEST_CONTROLS !== "local-only") {
+				return new Response("Not found", { status: 404 });
+			}
+			this.ctx.abort("Intentional local runner recovery proof");
+		}
 		if (!this.handler) {
 			this.runnerId = runnerId;
 			this.handler = HttpRouter.toWebHandler(
@@ -473,6 +604,9 @@ export class CounterRunner extends DurableObject {
 
 		const startupResponse = await this.startup;
 		if (!startupResponse.ok) return startupResponse;
+		if (url.pathname === "/debug/instance" && this.env.REPRO_TEST_CONTROLS === "local-only") {
+			return Response.json({ runnerId, instanceId: this.instanceId });
+		}
 		return this.handler.handler(request);
 	}
 }
@@ -484,16 +618,36 @@ export default {
 			return clientHandlerFor(env).handler(request);
 		}
 		if (url.pathname === "/workflow/poll" && request.method === "GET") {
-			return fetchRunner(env, runnerIds[0], request);
+			const runnerId = url.searchParams.get("via") ?? runnerIds[0];
+			if (!runnerIds.includes(runnerId)) return new Response("Unknown runner", { status: 400 });
+			return fetchRunner(env, runnerId, request);
 		}
 		if (url.pathname === "/task/prepare-recovery" && request.method === "POST") {
 			return fetchRunner(env, runnerIds[0], request);
 		}
-		if (url.pathname === "/task/status" && request.method === "GET") {
+		if (url.pathname === "/task/dispatch-interrupted" && request.method === "POST") {
 			return fetchRunner(env, runnerIds[0], request);
 		}
+		if (url.pathname === "/task/status" && request.method === "GET") {
+			const runnerId = url.searchParams.get("via") ?? runnerIds[0];
+			if (!runnerIds.includes(runnerId)) return new Response("Unknown runner", { status: 400 });
+			return fetchRunner(env, runnerId, request);
+		}
 		if (url.pathname === "/debug/workflow-counter" && request.method === "GET") {
-			return fetchRunner(env, runnerIds[0], request);
+			const runnerId = url.searchParams.get("via") ?? runnerIds[0];
+			if (!runnerIds.includes(runnerId)) return new Response("Unknown runner", { status: 400 });
+			return fetchRunner(env, runnerId, request);
+		}
+		if (url.pathname === "/debug/workflow-attempts" && request.method === "GET") {
+			const runnerId = url.searchParams.get("via") ?? runnerIds[0];
+			if (!runnerIds.includes(runnerId)) return new Response("Unknown runner", { status: 400 });
+			return fetchRunner(env, runnerId, request);
+		}
+		if (["/debug/instance", "/debug/abort"].includes(url.pathname)) {
+			const runnerId = url.searchParams.get("runner") ?? runnerIds[0];
+			if (!runnerIds.includes(runnerId)) return new Response("Unknown runner", { status: 400 });
+			const runnerUrl = new URL(url.pathname, request.url);
+			return fetchRunner(env, runnerId, new Request(runnerUrl, { method: request.method }));
 		}
 		if (url.pathname === "/prepare" && request.method === "POST") {
 			await Promise.all(

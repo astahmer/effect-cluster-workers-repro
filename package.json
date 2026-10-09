@@ -6,6 +6,7 @@
     "dev:proof": "wrangler dev --persist-to .wrangler/proof-state",
     "dev:pg": "wrangler dev --config wrangler.pg.toml --port 8790 --persist-to .wrangler/pg-proof-state",
     "prove": "node scripts/prove.mjs",
+    "prove:runner-recovery": "node scripts/prove-runner-recovery.mjs",
     "prove:mailbox": "node --env-file-if-exists=.pg-repro.env scripts/prove-mailbox-claims.mjs",
     "deploy": "wrangler deploy",
     "deploy:check": "wrangler deploy --dry-run"
